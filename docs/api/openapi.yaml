@@ -1,0 +1,468 @@
+openapi: 3.0.3
+info:
+  title: VulnTriage API
+  version: 0.1.0
+  contact:
+    name: Команда kepler22
+    url: https://github.com/AIProgramIngeneering2026/team-kepler22
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+  description: |
+    Сервис сортирует уязвимости в зависимостях проекта по реальной опасности.
+    Клиент отправляет SBOM, сервис создаёт Job и проверяет его в фоне.
+    Все ошибки приходят в едином формате Error. Каждый ответ содержит заголовок X-Request-ID.
+servers:
+  - url: http://localhost:8080
+    description: Локальный запуск через docker compose up
+tags:
+  - name: jobs
+    description: Проверки SBOM
+  - name: service
+    description: Служебные операции
+security:
+  - ApiKey: []
+
+paths:
+  /jobs:
+    post:
+      operationId: createJob
+      tags: [jobs]
+      summary: Создать проверку SBOM
+      description: |
+        Проверяет запрос до создания Job. Если запрос верный, сохраняет Job в состоянии created и сразу отвечает 202.
+        Повтор с тем же Idempotency-Key и тем же телом в течение 24 часов возвращает прежний Job с кодом 200.
+        Без Idempotency-Key каждый запрос создаёт новый Job.
+        Ограничения: тело не больше 5 МБ, в SBOM не больше 10 000 компонентов.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateJobRequest'
+      responses:
+        '202':
+          description: Job создан
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '200':
+          description: Job с таким Idempotency-Key и тем же телом уже создан, возвращается он
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          description: |
+            invalid_params, если тело не JSON, SBOM не в формате CycloneDX, больше 10 000 компонентов
+            или неверный тип поля. Имя поля в details.field.
+            unknown_tool, если в sources есть источник, которого нет в Registry. Имя источника в details.field.
+            Job не создаётся.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                invalidParams:
+                  value:
+                    error:
+                      code: invalid_params
+                      message: SBOM must be CycloneDX JSON
+                      request_id: 7f3c2a10
+                      details:
+                        field: sbom.bomFormat
+                unknownTool:
+                  value:
+                    error:
+                      code: unknown_tool
+                      message: source nvd is not registered
+                      request_id: 7f3c2a11
+                      details:
+                        field: sources[2]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: idempotency_conflict, если Idempotency-Key уже использован с другим телом. Job не создаётся.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '413':
+          description: payload_too_large, если тело больше 5 МБ. Job не создаётся.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs/{id}:
+    get:
+      operationId: getJob
+      tags: [jobs]
+      summary: Получить состояние Job и отчёт
+      description: |
+        report равен null, пока Job в created или running, а также в failed и cancelled.
+        В done и partial report заполнен, в partial список missing_sources не пустой.
+        В failed поле error объясняет причину.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Job найден
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/XRequestID'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/InvalidId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/JobNotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /jobs/{id}/cancel:
+    post:
+      operationId: cancelJob
+      tags: [jobs]
+      summary: Отменить проверку
+      description: |
+        Отменяет Job в created или running. Запросы к источникам прерываются, отчёт не сохраняется.
+        Job переходит в cancelled не позже чем через 2 секунды.
+        Повторная отмена уже отменённого Job и отмена завершённого дают 409 invalid_transition.
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Job отменён, в теле Job в состоянии cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '400':
+          $ref: '#/components/responses/InvalidId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/JobNotFound'
+        '409':
+          description: invalid_transition, Job уже в конечном состоянии. Состояние не меняется.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /health:
+    get:
+      operationId: health
+      tags: [service]
+      summary: Проверка работоспособности
+      description: Проверяет, что сервис запущен и база данных отвечает. Ключ API не нужен.
+      security: []
+      responses:
+        '200':
+          description: Сервис и база доступны
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: База недоступна
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+  securitySchemes:
+    ApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Один ключ на команду, задаётся переменной окружения VULNTRIAGE_API_KEY. См. ADR-0003.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Ключ хранится 24 часа. См. ADR-0002.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    JobId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  headers:
+    XRequestID:
+      description: Correlation ID запроса, тот же, что в логах и в error.request_id
+      schema:
+        type: string
+
+  responses:
+    Unauthorized:
+      description: unauthorized, нет заголовка X-API-Key или ключ неверный
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    JobNotFound:
+      description: job_not_found, Job с таким id нет
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InvalidId:
+      description: invalid_params, id не в формате UUID, details.field = id
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    InternalError:
+      description: internal_error, непредвиденная ошибка сервиса
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    CreateJobRequest:
+      type: object
+      required: [sbom]
+      properties:
+        sbom:
+          $ref: '#/components/schemas/CycloneDXSbom'
+        sources:
+          type: array
+          description: Какие источники запускать. По умолчанию все зарегистрированные.
+          minItems: 1
+          items:
+            type: string
+          example: [osv, kev, epss]
+
+    CycloneDXSbom:
+      type: object
+      description: SBOM в формате CycloneDX JSON. Проверяются только поля ниже, остальные игнорируются.
+      required: [bomFormat, specVersion, components]
+      properties:
+        bomFormat:
+          type: string
+          enum: [CycloneDX]
+        specVersion:
+          type: string
+          example: '1.5'
+        components:
+          type: array
+          maxItems: 10000
+          items:
+            type: object
+            required: [name]
+            properties:
+              name:
+                type: string
+              version:
+                type: string
+              purl:
+                type: string
+                example: pkg:npm/lodash@4.17.11
+      additionalProperties: true
+
+    Job:
+      type: object
+      required: [id, status, created_at, sources]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [created, running, done, partial, failed, cancelled]
+        created_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        sources:
+          type: array
+          items:
+            type: string
+        error:
+          $ref: '#/components/schemas/JobError'
+        report:
+          $ref: '#/components/schemas/Report'
+
+    JobError:
+      type: object
+      nullable: true
+      description: Заполнено только в состоянии failed
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [source_unavailable, bad_source_response, interrupted, internal_error]
+        message:
+          type: string
+        source:
+          type: string
+          description: Источник, из-за которого Job не удался
+          example: osv
+
+    Report:
+      type: object
+      nullable: true
+      required: [findings, skipped, missing_sources]
+      properties:
+        findings:
+          type: array
+          description: Отсортированы по уровню, внутри уровня по EPSS и CVSS
+          items:
+            $ref: '#/components/schemas/Finding'
+        skipped:
+          type: array
+          description: Компоненты, которые не проверялись
+          items:
+            $ref: '#/components/schemas/Skipped'
+        missing_sources:
+          type: array
+          description: Источники, которые не ответили. Не пустой только в partial.
+          items:
+            type: string
+        data_dates:
+          type: object
+          description: Дата данных, если они взяты из кэша
+          properties:
+            kev:
+              type: string
+              format: date
+
+    Finding:
+      type: object
+      required: [ids, package, level, reason, in_kev]
+      properties:
+        ids:
+          type: array
+          description: Все идентификаторы одной уязвимости после склейки
+          items:
+            type: string
+          example: [GO-2023-2102, GHSA-4374-p667-p6c8, CVE-2023-39325]
+        cves:
+          type: array
+          items:
+            type: string
+        package:
+          $ref: '#/components/schemas/Package'
+        level:
+          type: string
+          enum: [urgent, soon, planned, later, no_data]
+        reason:
+          type: string
+          example: есть в KEV
+        cvss:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 10
+        epss:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 1
+        in_kev:
+          type: boolean
+        malicious:
+          type: boolean
+        fixed_versions:
+          type: array
+          items:
+            type: string
+
+    Package:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        version:
+          type: string
+        ecosystem:
+          type: string
+          example: npm
+        purl:
+          type: string
+
+    Skipped:
+      type: object
+      required: [name, reason]
+      properties:
+        name:
+          type: string
+        purl:
+          type: string
+        reason:
+          type: string
+          enum: [no_version, unsupported_ecosystem]
+
+    Health:
+      type: object
+      required: [status, db]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        db:
+          type: string
+          enum: [ok, unavailable]
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+              enum:
+                - invalid_params
+                - unknown_tool
+                - payload_too_large
+                - unauthorized
+                - idempotency_conflict
+                - job_not_found
+                - invalid_transition
+                - internal_error
+            message:
+              type: string
+            request_id:
+              type: string
+            details:
+              type: object
+              properties:
+                field:
+                  type: string
+                  description: Какое поле запроса неверное
