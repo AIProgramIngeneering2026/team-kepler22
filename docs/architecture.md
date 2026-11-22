@@ -73,7 +73,7 @@ flowchart TB
 | Адаптеры | HTTP-запросы к OSV, KEV, EPSS, таймауты, повторы, разбор ответа | адреса, форматы и лимиты чужих API |
 | Job Repository | хранение Job, отчётов, ключей идемпотентности, кэша KEV; сохраняет Job, только если его состояние не изменил кто-то другой | SQL и выбор СУБД |
 
-Запрос проходит так. HTTP API передаёт SBOM в Job Service, тот проверяет запрос и сохраняет Job в состоянии `created`. Свободный обработчик забирает Job из хранилища (`ClaimNext`, модель pull, ADR-0001) и передаёт в Dispatcher. Dispatcher запускает сначала Tool с ролью Finder (OSV), потом Tool с ролью Enricher (KEV, EPSS), отдаёт находки Prioritizer и сохраняет отчёт.
+Запрос проходит так. HTTP API передаёт SBOM в Job Service, тот проверяет запрос и сохраняет Job в состоянии `created`. Свободный обработчик забирает Job из хранилища (`ClaimNext`, модель pull, ADR-0001) и передаёт в Dispatcher. Dispatcher запускает сначала Tool с ролью Finder (OSV), потом Tool с ролью Enricher (KEV, EPSS), отдаёт находки Prioritizer и записывает отчёт в Job, а обработчик сохраняет Job в хранилище.
 
 ## Жизненный цикл Job
 
